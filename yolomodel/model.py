@@ -20,9 +20,9 @@ class DroneController:
         # Controller state
         self.is_running = False
         self.movement_queue = Queue()
-        self.current_position = (0, 0, -3)
+        self.current_position = (0, 0, -3)  # Starting position
         self.movement_completed = threading.Event()
-        self.movement_completed.set()  # Initially set to True
+        self.movement_completed.set()
         
     def initialize(self):
         """Initialize drone for flight"""
@@ -30,12 +30,11 @@ class DroneController:
         self.client.armDisarm(True)
         
         self.client.takeoffAsync().join()
-        self.client.moveToZAsync(-3, 1).join()
+        self.client.moveToZAsync(-3, 1).join()  # Initial altitude
         
-    async def execute_movement(self, pos, yaw_rotation=90):
+    async def execute_movement(self, pos, yaw_rotation=None):
         """Execute a single movement command"""
         try:
-            # Create separate client for movement commands
             movement_client = airsim.MultirotorClient()
             
             print(f"Moving to position {pos}")
@@ -44,7 +43,7 @@ class DroneController:
                 lambda: movement_client.moveToPositionAsync(*pos, 2).join()
             )
             
-            if yaw_rotation:
+            if yaw_rotation is not None:
                 await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: movement_client.rotateToYawAsync(yaw_rotation, 5).join()
@@ -57,53 +56,49 @@ class DroneController:
             
     async def movement_processor(self):
         """Process movement commands from queue"""
+        # New survey pattern - a more comprehensive path that covers different areas
         positions = [
-            (0, 0, -3),
-            (5, 0, -3),
-            (5, 5, -3),
-            (0, 5, -3),
-            (0, 0, -3)
+            (0, 0, -3),      # Start position
+            (10, 0, -3),     # Move right
+            (10, 0, -5),     # Lower altitude for closer inspection
+            (10, 10, -5),    # Move forward
+            (0, 10, -5),     # Move left
+            (0, 10, -3),     # Higher altitude
+            (-10, 10, -3),   # Extended left
+            (-10, 0, -3),    # Move back
+            (-10, -10, -3),  # Move further back
+            (0, -10, -3),    # Return towards center
+            (0, 0, -3)       # Return to start
+        ]
+        
+        # Corresponding yaw rotations for each position
+        yaw_rotations = [
+            0,      # Forward
+            90,     # Right
+            90,     # Right looking down
+            180,    # Back
+            270,    # Left
+            270,    # Left higher
+            270,    # Further left
+            180,    # Back
+            180,    # Further back
+            0,      # Forward
+            0       # Center
         ]
         
         try:
             while self.is_running:
-                for pos in positions:
+                for pos, yaw in zip(positions, yaw_rotations):
                     if not self.is_running:
                         break
                     
                     self.movement_completed.clear()
-                    await self.execute_movement(pos)
-                    await asyncio.sleep(2)  # Pause between movements
+                    await self.execute_movement(pos, yaw)
+                    await asyncio.sleep(3)  # Longer pause for better observation
                     self.movement_completed.set()
                     
         except Exception as e:
             print(f"Movement processor error: {e}")
-            
-    def get_image(self):
-        """Get image from AirSim with proper decompression"""
-        try:
-            response = self.client.simGetImage("front_right", airsim.ImageType.Scene)
-            if response is None:
-                print("No image received")
-                return None
-                
-            img_raw = np.frombuffer(response, dtype=np.uint8)
-            
-            try:
-                img_rgb = cv2.imdecode(img_raw, cv2.IMREAD_COLOR)
-                if img_rgb is None:
-                    print("Failed to decode image")
-                    return None
-                    
-                return img_rgb
-                
-            except Exception as decode_err:
-                print(f"Image decode error: {decode_err}")
-                return None
-                
-        except Exception as e:
-            print(f"Image capture error: {e}")
-            return None
             
     async def detection_loop(self):
         """Asynchronous detection loop"""
@@ -118,7 +113,6 @@ class DroneController:
         try:
             while self.is_running:
                 img = self.get_image()
-                # print(f"Image dimensions: {img.shape}") 
                 
                 if img is None:
                     await asyncio.sleep(0.1)
@@ -169,31 +163,6 @@ class DroneController:
                             cv2.putText(display_frame, label, (x1, y1 - 10),
                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 
-                # # Add FPS counter
-                # cv2.putText(
-                #     display_frame,
-                #     f"FPS: {fps:.1f}",
-                #     (10,30),
-                #     cv2.FONT_HERSHEY_SIMPLEX,
-                #     0.4,
-                #     (0, 255, 0),
-                #     2
-                # )
-                
-                # # Show drone position
-                # pos = self.client.simGetVehiclePose().position
-                # pos_text = f"Pos: ({pos.x_val:.1f}, {pos.y_val:.1f}, {pos.z_val:.1f})"
-                # cv2.putText(
-                #     display_frame,
-                #     pos_text,
-                #     (10, 60),
-                #     cv2.FONT_HERSHEY_SIMPLEX,
-                #     0.4,
-                #     (0, 255, 0),
-                #     2
-                # )
-                
-                
                 cv2.imshow('YOLOv8 Inference', display_frame)
                 
                 # Check for exit
@@ -208,7 +177,33 @@ class DroneController:
         except Exception as e:
             print(f"Detection error: {e}")
             self.is_running = False
+
+    def get_image(self):
+        """Get image from AirSim with proper decompression"""
+        try:
+            response = self.client.simGetImage("front_right", airsim.ImageType.Scene)
+            if response is None:
+                print("No image received")
+                return None
+                
+            img_raw = np.frombuffer(response, dtype=np.uint8)
             
+            try:
+                img_rgb = cv2.imdecode(img_raw, cv2.IMREAD_COLOR)
+                if img_rgb is None:
+                    print("Failed to decode image")
+                    return None
+                    
+                return img_rgb
+                
+            except Exception as decode_err:
+                print(f"Image decode error: {decode_err}")
+                return None
+                
+        except Exception as e:
+            print(f"Image capture error: {e}")
+            return None
+
     async def run(self):
         """Main run loop using asyncio"""
         self.is_running = True
