@@ -1,311 +1,274 @@
 import airsim
-import cv2
 import numpy as np
+import cv2
 from ultralytics import YOLO
 import time
-import math
+import threading
+from queue import Queue
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
-class AirSimVisDroneNavigator:
-    def __init__(self, model_path, survey_size=30, stripe_width=5, altitude=5, velocity=0.5):
-        # Initialize AirSim
+class DroneController:
+    def __init__(self, model_path='model.pt'):
+        print("Connecting to drone...")
         self.client = airsim.MultirotorClient()
         self.client.confirmConnection()
-        print("AirSim connected successfully")
         
-        print("Requesting control...")
-        self.client.enableApiControl(True)
-        time.sleep(0.5)
-        
-        # Survey parameters
-        self.boxsize = survey_size
-        self.stripewidth = stripe_width
-        self.altitude = altitude
-        self.velocity = velocity
-        self.start_position = None
-        
-        # Display parameters - easily adjustable
-        self.window_width = 960
-        self.window_height = 540
-        # Adjust these values to change text appearance
-        self.text_scale = 0.4  # Smaller text (was 0.5)
-        self.text_thickness = 1
-        self.box_thickness = 2
-        self.text_color = (0, 255, 0)  # BGR Green
-        
-        # Collision avoidance parameters
-        self.safe_distance = 5.0  # meters
-        self.max_avoid_attempts = 3
-        self.avoid_step_size = 3.0  # meters
-        
-        # Performance optimization
-        self.process_every_n_frames = 3  # Process every 3rd frame
-        self.frame_count = 0
-        
-        # Load YOLO model
         print("Loading YOLO model...")
         self.model = YOLO(model_path)
-        print("YOLO model loaded successfully")
         
-        # Create display window
-        cv2.namedWindow('Drone View', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Drone View', self.window_width, self.window_height)
-    
-    def check_collision(self):
-        """Check for obstacles in multiple directions"""
-        collision_info = self.client.simGetCollisionInfo()
-        if collision_info.has_collided:
-            return True
-            
-        # Get lidar data or distance sensor readings
-        distance_front = float('inf')
-        distance_left = float('inf')
-        distance_right = float('inf')
+        # Controller state
+        self.is_running = False
+        self.movement_queue = Queue()
+        self.current_position = (0, 0, -3)
+        self.movement_completed = threading.Event()
+        self.movement_completed.set()  # Initially set to True
         
+    def initialize(self):
+        """Initialize drone for flight"""
+        self.client.enableApiControl(True)
+        self.client.armDisarm(True)
+        
+        self.client.takeoffAsync().join()
+        self.client.moveToZAsync(-3, 1).join()
+        
+    async def execute_movement(self, pos, yaw_rotation=90):
+        """Execute a single movement command"""
         try:
-            lidar_data = self.client.getLidarData()
-            if len(lidar_data.point_cloud) > 3:
-                points = np.array(lidar_data.point_cloud, dtype=np.dtype('f4'))
-                points = points.reshape((-1, 3))
-                
-                # Check different directions
-                for point in points:
-                    distance = np.sqrt(point[0]**2 + point[1]**2 + point[2]**2)
-                    angle = math.atan2(point[1], point[0])
-                    
-                    # Update minimum distances based on angle
-                    if abs(angle) < math.pi/6:  # Front sector
-                        distance_front = min(distance_front, distance)
-                    elif angle > math.pi/3:  # Left sector
-                        distance_left = min(distance_left, distance)
-                    elif angle < -math.pi/3:  # Right sector
-                        distance_right = min(distance_right, distance)
-        
-        except:
-            pass
-        
-        return min(distance_front, distance_left, distance_right) < self.safe_distance
-    
-    def find_safe_path(self, start, end):
-        """Find safe path avoiding obstacles"""
-        if not self.check_collision():
-            return [end]
+            # Create separate client for movement commands
+            movement_client = airsim.MultirotorClient()
             
-        safe_points = []
-        current = start
-        
-        for _ in range(self.max_avoid_attempts):
-            # Try different directions
-            directions = [
-                (self.avoid_step_size, 0),  # Forward
-                (0, self.avoid_step_size),  # Right
-                (0, -self.avoid_step_size), # Left
-                (-self.avoid_step_size, 0)  # Back
-            ]
+            print(f"Moving to position {pos}")
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: movement_client.moveToPositionAsync(*pos, 2).join()
+            )
             
-            for dx, dy in directions:
-                test_point = airsim.Vector3r(
-                    current.x_val + dx,
-                    current.y_val + dy,
-                    current.z_val
+            if yaw_rotation:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: movement_client.rotateToYawAsync(yaw_rotation, 5).join()
                 )
-                
-                # Move to test point and check for collisions
-                self.client.simSetVehiclePose(
-                    airsim.Pose(test_point, airsim.Quaternionr()),
-                    True
-                )
-                
-                if not self.check_collision():
-                    safe_points.append(test_point)
-                    current = test_point
-                    break
             
-            if current.distance_to(end) < self.safe_distance:
-                safe_points.append(end)
-                break
-                
-        return safe_points if safe_points else [end]
-    
-    def get_frame_with_detections(self):
-        """Get camera frame and run detections with performance optimization"""
-        try:
-            # Get frame
-            responses = self.client.simGetImages([
-                airsim.ImageRequest("0", airsim.ImageType.Scene, False, False)
-            ])
-            
-            if not responses:
-                return None
-            print("Frame received")
-            # Convert to image
-            response = responses[0]
-            img1d = np.frombuffer(response.image_data_uint8, dtype=np.uint8)
-            frame = img1d.reshape(response.height, response.width, 3)
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            
-            # Only process every nth frame
-            self.frame_count += 1
-            if self.frame_count % self.process_every_n_frames == 0:
-                # Run detection
-                results = self.model.predict(
-                    source=frame,
-                    conf=0.4,
-                    max_det=20
-                )
-                
-                # Draw detections
-                for result in results:
-                    boxes = result.boxes
-                    for box in boxes:
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        cls = int(box.cls[0])
-                        cls_name = result.names[cls]
-                        
-                        # Draw box
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), 
-                                    self.text_color, self.box_thickness)
-                        
-                        # Draw label (class name only, no confidence)
-                        cv2.putText(frame, cls_name, (x1, y1-5),
-                                  cv2.FONT_HERSHEY_SIMPLEX, self.text_scale,
-                                  self.text_color, self.text_thickness)
-                        
-                        # Print to console
-                        print(f"Detected {cls_name} with confidence {confidence:.2f}")
-                    
-            
-            return frame
-            
-        except Exception as e:
-            print(f"Frame processing error: {e}")
-            return None
-    
-    def safe_move_to_position(self, x, y, z):
-        """Execute movement with collision avoidance"""
-        print(f"Moving to position: X={x:.1f}, Y={y:.1f}, Z={z:.1f}")
-        
-        try:
-            # Get current position
-            start_pos = self.client.getMultirotorState().kinematics_estimated.position
-            end_pos = airsim.Vector3r(x, y, z)
-            
-            # Check for direct path
-            if self.check_collision():
-                print("Obstacle detected, finding safe path...")
-                waypoints = self.find_safe_path(start_pos, end_pos)
-            else:
-                waypoints = [end_pos]
-            
-            # Move through waypoints
-            for waypoint in waypoints:
-                self.client.moveToPositionAsync(
-                    waypoint.x_val,
-                    waypoint.y_val,
-                    waypoint.z_val,
-                    self.velocity
-                ).join()
-                
-                # Show frame after movement
-                frame = self.get_frame_with_detections()
-                if frame is not None:
-                    cv2.imshow('Drone View', frame)
-                    cv2.waitKey(1)
-            
-            return True
+            self.current_position = pos
             
         except Exception as e:
             print(f"Movement error: {e}")
-            return False
-    
-    def survey_mission(self):
+            
+    async def movement_processor(self):
+        """Process movement commands from queue"""
+        positions = [
+            (0, 0, -3),
+            (5, 0, -3),
+            (5, 5, -3),
+            (0, 5, -3),
+            (0, 0, -3)
+        ]
+        
         try:
-            print("\n=== Starting Survey Mission ===")
-            
-            # Store starting position
-            self.start_position = self.client.getMultirotorState().kinematics_estimated.position
-            
-            # Takeoff sequence
-            print("Arming...")
-            self.client.armDisarm(True)
-            time.sleep(1)
-            
-            print("Taking off...")
-            self.client.takeoffAsync().join()
-            time.sleep(2)
-            
-            # Move to survey altitude
-            z = -self.altitude
-            print(f"Moving to {self.altitude}m altitude...")
-            if not self.safe_move_to_position(0, 0, z):
-                raise Exception("Failed to reach altitude")
-            
-            # Execute survey pattern
-            print("Starting grid survey...")
-            x = -self.boxsize/2
-            while x <= self.boxsize/2:
-                self.get_frame_with_detections()
-                # Move to start of line
-                if not self.safe_move_to_position(x, -self.boxsize/2, z):
-                    raise Exception("Failed to reach line start")
-                self.get_frame_with_detections()
-                # Move front to back
-                if not self.safe_move_to_position(x, self.boxsize/2, z):
-                    raise Exception("Failed to complete line")
-                self.get_frame_with_detections()
-                
-                x += self.stripewidth
-            
-            print("\n=== Survey Complete ===")
-            
-        except KeyboardInterrupt:
-            print("\nMission interrupted by user")
+            while self.is_running:
+                for pos in positions:
+                    if not self.is_running:
+                        break
+                    
+                    self.movement_completed.clear()
+                    await self.execute_movement(pos)
+                    await asyncio.sleep(2)  # Pause between movements
+                    self.movement_completed.set()
+                    
         except Exception as e:
-            print(f"\nMission error: {e}")
-        finally:
+            print(f"Movement processor error: {e}")
+            
+    def get_image(self):
+        """Get image from AirSim with proper decompression"""
+        try:
+            response = self.client.simGetImage("front_right", airsim.ImageType.Scene)
+            if response is None:
+                print("No image received")
+                return None
+                
+            img_raw = np.frombuffer(response, dtype=np.uint8)
+            
             try:
-                # Return home
-                print("\nReturning to start position...")
-                if self.start_position:
-                    self.safe_move_to_position(
-                        self.start_position.x_val,
-                        self.start_position.y_val,
-                        z
+                img_rgb = cv2.imdecode(img_raw, cv2.IMREAD_COLOR)
+                if img_rgb is None:
+                    print("Failed to decode image")
+                    return None
+                    
+                return img_rgb
+                
+            except Exception as decode_err:
+                print(f"Image decode error: {decode_err}")
+                return None
+                
+        except Exception as e:
+            print(f"Image capture error: {e}")
+            return None
+            
+    async def detection_loop(self):
+        """Asynchronous detection loop"""
+        fps = 0
+        frame_count = 0
+        start_time = time.time()
+        CONFIDENCE_THRESHOLD = 0.7
+
+        cv2.namedWindow('YOLOv8 Inference', cv2.WINDOW_NORMAL)  # Make window resizable
+        cv2.resizeWindow('YOLOv8 Inference', 384, 216)  # Set window size to 1280x720
+        
+        try:
+            while self.is_running:
+                img = self.get_image()
+                # print(f"Image dimensions: {img.shape}") 
+                
+                if img is None:
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # Run detection in thread pool to avoid blocking
+                with ThreadPoolExecutor() as executor:
+                    results = await asyncio.get_event_loop().run_in_executor(
+                        executor,
+                        lambda: self.model(img, conf=CONFIDENCE_THRESHOLD) 
                     )
                 
-                print("Landing...")
-                self.client.landAsync().join()
-                time.sleep(2)
+                # Update FPS
+                frame_count += 1
+                elapsed_time = time.time() - start_time
+                if elapsed_time >= 1.0:
+                    fps = frame_count / elapsed_time
+                    frame_count = 0
+                    start_time = time.time()
                 
-                print("Disarming...")
-                self.client.armDisarm(False)
+                # Create a copy of the original image for drawing
+                display_frame = img.copy()
                 
-            except Exception as e:
-                print(f"Landing error: {e}")
+                # Draw results
+                for r in results:
+                    # Get boxes and confidence scores
+                    boxes = r.boxes.cpu().numpy()
+                    
+                    # Draw each detection that meets our confidence threshold
+                    for box in boxes:
+                        # Get confidence score
+                        confidence = float(box.conf)
+                        
+                        # Only draw if confidence meets threshold
+                        if confidence >= CONFIDENCE_THRESHOLD:
+                            # Get coordinates
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            
+                            # Get class name and confidence
+                            class_id = int(box.cls[0])
+                            class_name = r.names[class_id]
+                            
+                            # Draw box
+                            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            
+                            # Add label with class name and confidence
+                            label = f"{class_name} {confidence:.2f}"
+                            cv2.putText(display_frame, label, (x1, y1 - 10),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                
+                # # Add FPS counter
+                # cv2.putText(
+                #     display_frame,
+                #     f"FPS: {fps:.1f}",
+                #     (10,30),
+                #     cv2.FONT_HERSHEY_SIMPLEX,
+                #     0.4,
+                #     (0, 255, 0),
+                #     2
+                # )
+                
+                # # Show drone position
+                # pos = self.client.simGetVehiclePose().position
+                # pos_text = f"Pos: ({pos.x_val:.1f}, {pos.y_val:.1f}, {pos.z_val:.1f})"
+                # cv2.putText(
+                #     display_frame,
+                #     pos_text,
+                #     (10, 60),
+                #     cv2.FONT_HERSHEY_SIMPLEX,
+                #     0.4,
+                #     (0, 255, 0),
+                #     2
+                # )
+                
+                
+                cv2.imshow('YOLOv8 Inference', display_frame)
+                
+                # Check for exit
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    self.is_running = False
+                    break
+                
+                # Give other tasks a chance to run
+                await asyncio.sleep(0.01)
+                
+        except Exception as e:
+            print(f"Detection error: {e}")
+            self.is_running = False
             
-            cv2.destroyAllWindows()
-            print("Mission complete")
+    async def run(self):
+        """Main run loop using asyncio"""
+        self.is_running = True
+        
+        try:
+            # Create tasks for movement and detection
+            movement_task = asyncio.create_task(self.movement_processor())
+            detection_task = asyncio.create_task(self.detection_loop())
+            
+            # Wait for both tasks to complete
+            await asyncio.gather(movement_task, detection_task)
+            
+        except Exception as e:
+            print(f"Run error: {e}")
+        finally:
+            await self.stop()
+            
+    async def stop(self):
+        """Stop all operations safely"""
+        if not self.is_running:
+            return
+            
+        print("Stopping operations...")
+        self.is_running = False
+        
+        try:
+            # Create a new client for landing
+            landing_client = airsim.MultirotorClient()
+            # Return to start and land
+            landing_client.moveToPositionAsync(0, 0, -3, 2).join()
+            landing_client.landAsync().join()
+            landing_client.armDisarm(False)
+            
+        except Exception as e:
+            print(f"Error during landing: {e}")
+            try:
+                self.client.emergencyStop()
+            except:
+                print("Emergency stop failed")
 
-def main():
-    MODEL_PATH = 'D:/FAU Courses/Fall 2024 Semester/EGN4952 Engineering Design II/FormationControl_IntegrateModel/Include/yolomodel/model.pt'
-    
-    print("\n=== Initializing System ===")
+async def main():
+    drone = None
     try:
-        navigator = AirSimVisDroneNavigator(
-            model_path=MODEL_PATH,
-            survey_size=30,
-            stripe_width=5,
-            altitude=5,
-            velocity=0.5  # Reduced velocity
-        )
+        # Create and initialize controller
+        drone = DroneController()
+        print("Initializing drone...")
+        drone.initialize()
         
-        navigator.survey_mission()
+        # Run main loop
+        await drone.run()
         
+    except KeyboardInterrupt:
+        print("\nProgram interrupted by user")
     except Exception as e:
-        print(f"System initialization error: {e}")
-        print("Please ensure that:")
-        print("1. Unreal Engine simulator is running")
-        print("2. No other scripts are connected to AirSim")
-        print("3. The AirSim settings are correctly configured")
+        print(f"Program error: {e}")
+    finally:
+        if drone:
+            await drone.stop()
+        cv2.destroyAllWindows()
+        print("Program ended")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

@@ -1,198 +1,165 @@
 import airsim
-import cv2
 import numpy as np
+import cv2
 from ultralytics import YOLO
 import time
-import random
+from threading import Lock
 
-class AirSimVisDroneNavigator:
-    def __init__(self, model_path, survey_size=20, stripe_width=5, altitude=4, velocity=0.3):
-        # Initialize AirSim
+class AirSimYOLODetector:
+    def __init__(self, model_path='yolov8n.pt'):
+        # Initialize AirSim client
         self.client = airsim.MultirotorClient()
         self.client.confirmConnection()
-        print("AirSim connected successfully")
         
-        print("Requesting control...")
-        self.client.enableApiControl(True)
-        time.sleep(0.5)
-        
-        # Survey parameters
-        self.boxsize = survey_size
-        self.stripewidth = stripe_width
-        self.altitude = altitude
-        self.velocity = velocity
-        self.start_position = None
-
-        # Display parameters
-        self.window_width = 960
-        self.window_height = 540
-        # Text size
-        self.text_scale = 0.4  
-        self.text_thickness = 1
-        self.box_thickness = 2
-        self.text_color = (0, 255, 0)  # BGR Green
-        
-        # Performance optimization
-        self.process_every_n_frames = 1  # Process every frame
-        self.frame_count = 0
-        
-        # Load YOLO model
-        print("Loading YOLO model...")
+        # Initialize YOLOv8 model
         self.model = YOLO(model_path)
-        print("YOLO model loaded successfully")
         
-        # Create OpenCV window
-        cv2.namedWindow('Drone View', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Drone View', self.window_width, self.window_height)
-    
-    def get_frame_with_detections(self):
+        # Configure camera settings
+        self.camera_name = "0"
+        self.image_type = airsim.ImageType.Scene
+        
+        # Lock for thread safety
+        self.lock = Lock()
+        
+        # Connect to drone
+        self.client.enableApiControl(True)
+        self.client.armDisarm(True)
+        
+    def get_camera_image(self):
+        """Capture image from AirSim camera with proper decompression"""
         try:
-            # Get frame
-            responses = self.client.simGetImages([
-                airsim.ImageRequest("0", airsim.ImageType.Scene, False, False)
-            ])
-            
-            if not responses:
-                return None
-            print("Frame received")
-            # Convert to image
-            response = responses[0]
-            img1d = np.frombuffer(response.image_data_uint8, dtype=np.uint8)
-            frame = img1d.reshape(response.height, response.width, 3)
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            
-            # # Preprocess the frame for YOLO
-            # frame = cv2.resize(frame, (640, 360))
-            # frame = np.expand_dims(frame, axis=0)
-            # frame = frame / 255.0
-
-            # Only process every nth frame
-            self.frame_count += 1
-            if self.frame_count % self.process_every_n_frames == 0:
-                # Run detection
-                results = self.model.predict(
-                    source=frame,
-                    conf=0.4,
-                    max_det=20
-                )
-            
-            
-            # Draw detections on the frame
-            for result in results:
-                boxes = result.boxes
-                for box in boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    cls = int(box.cls[0])
-                    cls_name = result.names[cls]
-                    confidence = box.conf[0].item()
-                    
-                    # Draw box
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), 
-                                (0, 255, 0), 2)
-                    
-                    # Draw label
-                    cv2.putText(frame, cls_name, (x1, y1-5),
-                              cv2.FONT_HERSHEY_SIMPLEX, self.text_scale,
-                              self.text_color, self.text_thickness)
-                    
-                    # Print to console
-                    print(f"Detected {cls_name} with confidence {confidence:.2f}")
-            
-            # Display the frame in the OpenCV window
-            # cv2.imshow('Drone View', frame)
-            # cv2.waitKey(1)
-            
-            return frame
-            
+            with self.lock:
+                # Request image from AirSim
+                response = self.client.simGetImages([
+                    airsim.ImageRequest(self.camera_name, self.image_type, False, False)
+                ])
+                
+                if not response:
+                    print("No image received from AirSim")
+                    return None
+                
+                # Get the first image from response
+                image_response = response[0]
+                
+                # Get image data
+                img1d = np.frombuffer(image_response.image_data_uint8, dtype=np.uint8)
+                
+                # Reshape array to image dimensions from response
+                img_rgb = img1d.reshape(image_response.height, image_response.width, 3)
+                
+                # Convert to BGR for OpenCV
+                return cv2.cvtColor(img_rgb, cv2.COLOR_BGR2RGB)
+                
         except Exception as e:
-            print(f"Frame processing error: {e}")
+            print(f"Error capturing image: {e}")
             return None
-    
-    def survey_mission(self):
+            
+    def process_frame(self, frame):
+        """Process a single frame with YOLOv8"""
+        if frame is None:
+            return None, None
+            
         try:
-            print("\n=== Starting Survey Mission ===")
+            # Run detection
+            results = self.model(frame)
             
-            # Store starting position
-            self.start_position = self.client.getMultirotorState().kinematics_estimated.position
-            
-            # Takeoff sequence
-            print("Arming...")
-            self.client.armDisarm(True)
-            time.sleep(1)
-            
-            print("Taking off...")
-            self.client.takeoffAsync().join()
-            time.sleep(2)
-            
-            # Move to survey altitude
-            z = -self.altitude
-            print(f"Moving to {self.altitude}m altitude...")
-            self.client.moveToPositionAsync(0, 0, z, self.velocity).join()
-            
-            # Execute survey pattern
-            print("Starting grid survey...")
-            y = -self.boxsize/2
-            while y <= self.boxsize/2:
-                # Move up and down
-                self.client.moveToPositionAsync(0, y, z, self.velocity).join()
-                self.get_frame_with_detections()
-                self.client.moveToPositionAsync(0, -y, z, self.velocity).join()
-                self.get_frame_with_detections()
+            if not results:
+                return frame, None
                 
-                y += self.stripewidth
+            # Get the first result
+            result = results[0]
             
-            print("\n=== Survey Complete ===")
-        
-        except KeyboardInterrupt:
-            print("\nMission interrupted by user")
+            # Draw detections
+            annotated_frame = self.draw_detections(frame, result)
+            
+            return annotated_frame, result
+            
         except Exception as e:
-            print(f"\nMission error: {e}")
-        finally:
-            try:
-                # Return home
-                print("\nReturning to start position...")
-                if self.start_position:
-                    self.client.moveToPositionAsync(
-                        self.start_position.x_val,
-                        self.start_position.y_val,
-                        z,
-                        self.velocity
-                    ).join()
-                
-                print("Landing...")
-                self.client.landAsync().join()
-                time.sleep(2)
-                
-                print("Disarming...")
-                self.client.armDisarm(False)
+            print(f"Error processing frame: {e}")
+            return frame, None
+        
+    def draw_detections(self, image, detection_result):
+        """Draw detection boxes on the image"""
+        if image is None or detection_result is None:
+            return image
             
-            except Exception as e:
-                print(f"Landing error: {e}")
+        img_copy = image.copy()
+        
+        try:
+            # Draw each detection
+            for box in detection_result.boxes:
+                # Get box coordinates
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                conf = box.conf[0].cpu().numpy()
+                cls = box.cls[0].cpu().numpy()
+                
+                # Convert to integers
+                x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+                
+                # Draw box
+                cv2.rectangle(img_copy, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                
+                # Draw label
+                label = f"{self.model.names[int(cls)]} {conf:.2f}"
+                cv2.putText(img_copy, label, (x1, y1 - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                
+        except Exception as e:
+            print(f"Error drawing detections: {e}")
             
-            cv2.destroyAllWindows()
-            print("Mission complete")
+        return img_copy
 
 def main():
-    MODEL_PATH = 'D:/FAU Courses/Fall 2024 Semester/EGN4952 Engineering Design II/FormationControl_IntegrateModel/Include/yolomodel/model.pt'
-    
-    print("\n=== Initializing System ===")
     try:
-        navigator = AirSimVisDroneNavigator(
-            model_path=MODEL_PATH,
-            survey_size=20,
-            stripe_width=5,
-            altitude=4,
-            velocity=0.6
-        )
+        # Initialize detector
+        detector = AirSimYOLODetector()
         
-        navigator.survey_mission()
+        print("Starting detection loop. Press 'q' to quit.")
         
+        frame_count = 0
+        start_time = time.time()
+        
+        while True:
+            # Get single frame
+            frame = detector.get_camera_image()
+            
+            if frame is not None:
+                # Process frame
+                annotated_frame, detections = detector.process_frame(frame)
+                
+                if annotated_frame is not None:
+                    # Calculate and display FPS
+                    frame_count += 1
+                    elapsed_time = time.time() - start_time
+                    if elapsed_time > 1.0:  # Update FPS every second
+                        fps = frame_count / elapsed_time
+                        print(f"FPS: {fps:.2f}")
+                        frame_count = 0
+                        start_time = time.time()
+                    
+                    # Display result
+                    cv2.imshow('AirSim YOLOv8 Detections', annotated_frame)
+                    
+                    # Print detections (optional - comment out if not needed)
+                    if detections is not None:
+                        for box in detections.boxes:
+                            cls = box.cls[0].cpu().numpy()
+                            conf = box.conf[0].cpu().numpy()
+                            print(f"Detected: {detector.model.names[int(cls)]} ({conf:.2f})")
+            
+            # Check for quit command
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+                
+    except KeyboardInterrupt:
+        print("\nStopping detection...")
     except Exception as e:
-        print(f"System initialization error: {e}")
-        print("Please ensure that:")
-        print("1. Unreal Engine simulator is running")
-        print("2. No other scripts are connected to AirSim")
-        print("3. The AirSim settings are correctly configured")
+        print(f"Error in main loop: {e}")
+        raise  # Re-raise exception for debugging
+    finally:
+        # Cleanup
+        cv2.destroyAllWindows()
+        print("Detection stopped.")
 
 if __name__ == "__main__":
     main()
